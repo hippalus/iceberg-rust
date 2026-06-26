@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use crate::spec::{MAIN_BRANCH, SnapshotReference, SnapshotRetention, TableMetadataRef};
 use crate::table::Table;
 use crate::transaction::action::{ActionCommit, TransactionAction};
-use crate::util::snapshot::is_ancestor_of;
+use crate::util::snapshot::{ancestors_of, is_ancestor_of};
 use crate::{Error, ErrorKind, Result, TableRequirement, TableUpdate};
 
 /// Every validation failure in this action is a `DataInvalid`.
@@ -44,9 +44,10 @@ fn default_branch(snapshot_id: i64) -> SnapshotReference {
 }
 
 /// A transaction action that manages snapshot references (branches and tags), mirroring Java
-/// `ManageSnapshots` / `UpdateSnapshotReferencesOperation`. It creates, removes, replaces, and
-/// renames branches and tags, sets per-ref retention, and fast-forwards branches; no snapshots are
-/// produced.
+/// `ManageSnapshots` (`UpdateSnapshotReferencesOperation` + `SetSnapshotOperation`). It creates,
+/// removes, replaces, and renames branches and tags, sets per-ref retention, fast-forwards
+/// branches, and moves the current snapshot (the `main` head) directly or by rolling back; no
+/// snapshots are produced.
 ///
 /// Builder methods only record operations; validation runs in [`commit`](TransactionAction::commit),
 /// which replays them in order against a working copy of the refs map (so `create_branch("a", id)`
@@ -101,6 +102,15 @@ enum RefOp {
     SetMaxRefAgeMs {
         name: String,
         value: i64,
+    },
+    SetCurrentSnapshot {
+        snapshot_id: i64,
+    },
+    RollbackTo {
+        snapshot_id: i64,
+    },
+    RollbackToTime {
+        timestamp_ms: i64,
     },
 }
 
@@ -217,6 +227,29 @@ impl ManageSnapshotsAction {
             name: name.into(),
             value,
         });
+        self
+    }
+
+    /// Set the current snapshot (the `main` branch head) to `snapshot_id`, with no ancestry
+    /// constraint. The snapshot must exist; `main`'s retention is preserved.
+    pub fn set_current_snapshot(mut self, snapshot_id: i64) -> Self {
+        self.ops.push(RefOp::SetCurrentSnapshot { snapshot_id });
+        self
+    }
+
+    /// Roll the `main` branch back to `snapshot_id`, which must be an ancestor of the current head.
+    pub fn rollback_to(mut self, snapshot_id: i64) -> Self {
+        self.ops.push(RefOp::RollbackTo { snapshot_id });
+        self
+    }
+
+    /// Roll the `main` branch back to the latest ancestor of the current head whose timestamp is
+    /// strictly older than `timestamp_ms`.
+    ///
+    /// The target is resolved at commit time against the current head's ancestry (builders have no
+    /// metadata access), where Java pins it at call time. The two agree for past timestamps.
+    pub fn rollback_to_time(mut self, timestamp_ms: i64) -> Self {
+        self.ops.push(RefOp::RollbackToTime { timestamp_ms });
         self
     }
 
@@ -356,6 +389,47 @@ impl ManageSnapshotsAction {
                     | SnapshotRetention::Tag { max_ref_age_ms } => *max_ref_age_ms = Some(*value),
                 }
             }
+            RefOp::SetCurrentSnapshot { snapshot_id } => {
+                Self::ensure_snapshot_exists(metadata, *snapshot_id)?;
+                Self::set_main(working_refs, *snapshot_id);
+            }
+            RefOp::RollbackTo { snapshot_id } => {
+                Self::ensure_snapshot_exists(metadata, *snapshot_id)?;
+                let current = Self::current_main_id(working_refs)?;
+                if !is_ancestor_of(metadata, current, *snapshot_id) {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot roll back to snapshot, not an ancestor of the current table state: {snapshot_id}"
+                        ),
+                    ));
+                }
+                Self::set_main(working_refs, *snapshot_id);
+            }
+            RefOp::RollbackToTime { timestamp_ms } => {
+                let current = Self::current_main_id(working_refs)?;
+                // Newest ancestor older than the cutoff. `ancestors_of` walks head -> root, so
+                // updating only on a strictly greater timestamp breaks ties toward the head
+                // (`max_by_key` would keep the older, last-seen one).
+                let target = ancestors_of(metadata, current)
+                    .filter(|snapshot| snapshot.timestamp_ms() < *timestamp_ms)
+                    .reduce(|newest, snapshot| {
+                        if snapshot.timestamp_ms() > newest.timestamp_ms() {
+                            snapshot
+                        } else {
+                            newest
+                        }
+                    })
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Cannot roll back, no valid snapshot older than: {timestamp_ms}"
+                            ),
+                        )
+                    })?;
+                Self::set_main(working_refs, target.snapshot_id());
+            }
         }
         Ok(())
     }
@@ -411,6 +485,36 @@ impl ManageSnapshotsAction {
             )));
         }
         Ok(())
+    }
+
+    /// Point `main` at `snapshot_id`, preserving its existing retention (or default branch retention
+    /// if `main` does not yet exist). Mirrors Java `setBranchSnapshot(snapshotId, MAIN_BRANCH)`.
+    fn set_main(working_refs: &mut HashMap<String, SnapshotReference>, snapshot_id: i64) {
+        let retention = working_refs
+            .get(MAIN_BRANCH)
+            .map(|reference| reference.retention.clone())
+            .unwrap_or(SnapshotRetention::Branch {
+                min_snapshots_to_keep: None,
+                max_snapshot_age_ms: None,
+                max_ref_age_ms: None,
+            });
+        working_refs.insert(MAIN_BRANCH.to_string(), SnapshotReference {
+            snapshot_id,
+            retention,
+        });
+    }
+
+    /// The current head of `main`, or an error if the table has no current snapshot to roll from.
+    fn current_main_id(working_refs: &HashMap<String, SnapshotReference>) -> Result<i64> {
+        working_refs
+            .get(MAIN_BRANCH)
+            .map(|reference| reference.snapshot_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Cannot roll back: table has no current snapshot",
+                )
+            })
     }
 }
 
@@ -1136,6 +1240,208 @@ mod tests {
         assert_eq!(refs.get("new"), Some(&branch(2)));
         assert_eq!(refs.get("t"), Some(&tag(2)));
         assert!(!refs.contains_key("old"));
+    }
+
+    /// 1 -> 2 -> 3 with `main` at 3, plus a forked snapshot 4 whose parent is 1 (so 4 is not an
+    /// ancestor of `main`).
+    fn table_forked() -> Table {
+        table_with(
+            vec![
+                snapshot(1, None, 35, TS + 1),
+                snapshot(2, Some(1), 36, TS + 2),
+                snapshot(3, Some(2), 37, TS + 3),
+                snapshot(4, Some(1), 38, TS + 4),
+            ],
+            vec![(MAIN_BRANCH, branch(3))],
+        )
+    }
+
+    #[tokio::test]
+    async fn test_set_current_snapshot() {
+        let table = table_main_chain();
+        let (updates, requirements) = commit(&table, action().set_current_snapshot(1)).await;
+        assert_eq!(set_ref(&updates, MAIN_BRANCH), Some(&branch(1)));
+        // Assert main is still at its base head (3) to conflict with a concurrent advance.
+        assert_eq!(requirement_for(&requirements, MAIN_BRANCH), Some(&Some(3)));
+    }
+
+    #[tokio::test]
+    async fn test_set_current_snapshot_allows_non_ancestor() {
+        // 4 is not an ancestor of main (3); set_current_snapshot has no ancestry constraint.
+        let table = table_forked();
+        let (updates, _) = commit(&table, action().set_current_snapshot(4)).await;
+        assert_eq!(set_ref(&updates, MAIN_BRANCH), Some(&branch(4)));
+    }
+
+    #[tokio::test]
+    async fn test_set_current_snapshot_unknown_fails() {
+        let table = table_main_chain();
+        assert!(
+            Arc::new(action().set_current_snapshot(999))
+                .commit(&table)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_current_snapshot_preserves_main_retention() {
+        let main_with_retention = SnapshotReference {
+            snapshot_id: 3,
+            retention: SnapshotRetention::Branch {
+                min_snapshots_to_keep: Some(5),
+                max_snapshot_age_ms: Some(1000),
+                max_ref_age_ms: None,
+            },
+        };
+        let table = table_with(
+            vec![
+                snapshot(1, None, 35, TS + 1),
+                snapshot(2, Some(1), 36, TS + 2),
+                snapshot(3, Some(2), 37, TS + 3),
+            ],
+            vec![(MAIN_BRANCH, main_with_retention)],
+        );
+        let (updates, _) = commit(&table, action().set_current_snapshot(1)).await;
+        assert_eq!(
+            set_ref(&updates, MAIN_BRANCH),
+            Some(&SnapshotReference {
+                snapshot_id: 1,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: Some(5),
+                    max_snapshot_age_ms: Some(1000),
+                    max_ref_age_ms: None,
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_current_snapshot_on_empty_table_creates_main() {
+        // No `main` ref: setting the current snapshot creates it and asserts it was absent.
+        let table = table_with(vec![snapshot(1, None, 35, TS + 1)], vec![("b", branch(1))]);
+        assert!(table.metadata().refs().get(MAIN_BRANCH).is_none());
+        let (updates, requirements) = commit(&table, action().set_current_snapshot(1)).await;
+        assert_eq!(set_ref(&updates, MAIN_BRANCH), Some(&branch(1)));
+        assert_eq!(requirement_for(&requirements, MAIN_BRANCH), Some(&None));
+    }
+
+    #[tokio::test]
+    async fn test_rollback_to_ancestor() {
+        let table = table_main_chain();
+        let (updates, requirements) = commit(&table, action().rollback_to(1)).await;
+        assert_eq!(set_ref(&updates, MAIN_BRANCH), Some(&branch(1)));
+        assert_eq!(requirement_for(&requirements, MAIN_BRANCH), Some(&Some(3)));
+    }
+
+    #[tokio::test]
+    async fn test_rollback_to_non_ancestor_fails() {
+        // 4 is not an ancestor of main (3).
+        let table = table_forked();
+        assert!(
+            Arc::new(action().rollback_to(4))
+                .commit(&table)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rollback_to_unknown_fails() {
+        let table = table_main_chain();
+        assert!(
+            Arc::new(action().rollback_to(999))
+                .commit(&table)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rollback_to_no_current_snapshot_fails() {
+        let table = table_with(vec![snapshot(1, None, 35, TS + 1)], vec![("b", branch(1))]);
+        assert!(
+            Arc::new(action().rollback_to(1))
+                .commit(&table)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rollback_to_time_selects_latest_older() {
+        // Snapshots 1,2,3 at TS+1, TS+2, TS+3; main at 3.
+        let table = table_main_chain();
+        // Strictly older than TS+3 -> snapshot 2 (TS+2).
+        let (updates, requirements) = commit(&table, action().rollback_to_time(TS + 3)).await;
+        assert_eq!(set_ref(&updates, MAIN_BRANCH), Some(&branch(2)));
+        assert_eq!(requirement_for(&requirements, MAIN_BRANCH), Some(&Some(3)));
+    }
+
+    #[tokio::test]
+    async fn test_rollback_to_time_boundary_is_exclusive() {
+        let table = table_main_chain();
+        // Strictly older than TS+2 -> snapshot 1 (TS+1); TS+2 itself is excluded.
+        let (updates, _) = commit(&table, action().rollback_to_time(TS + 2)).await;
+        assert_eq!(set_ref(&updates, MAIN_BRANCH), Some(&branch(1)));
+    }
+
+    #[tokio::test]
+    async fn test_rollback_to_time_none_older_fails() {
+        let table = table_main_chain();
+        // Nothing is older than the oldest snapshot's own timestamp.
+        assert!(
+            Arc::new(action().rollback_to_time(TS + 1))
+                .commit(&table)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rollback_to_time_tie_prefers_newer_ancestor() {
+        // Snapshots 2 and 3 share timestamp TS + 5; the one closer to the head (3) wins the tie.
+        let table = table_with(
+            vec![
+                snapshot(1, None, 35, TS + 1),
+                snapshot(2, Some(1), 36, TS + 5),
+                snapshot(3, Some(2), 37, TS + 5),
+                snapshot(4, Some(3), 38, TS + 10),
+            ],
+            vec![(MAIN_BRANCH, branch(4))],
+        );
+        let (updates, _) = commit(&table, action().rollback_to_time(TS + 6)).await;
+        assert_eq!(set_ref(&updates, MAIN_BRANCH), Some(&branch(3)));
+    }
+
+    #[tokio::test]
+    async fn test_rollback_to_time_resolves_from_current_head_ancestry() {
+        // The target is resolved at commit time from the current head's ancestry: forked snapshot 4
+        // is older than the cutoff but is NOT an ancestor of main (3), so it is never selected.
+        let table = table_with(
+            vec![
+                snapshot(1, None, 35, TS + 1),
+                snapshot(2, Some(1), 36, TS + 2),
+                snapshot(3, Some(2), 37, TS + 3),
+                snapshot(4, Some(1), 38, TS + 2),
+            ],
+            vec![(MAIN_BRANCH, branch(3))],
+        );
+        // Strictly older than TS + 3 -> snapshot 2 (on main's chain), not the forked 4.
+        let (updates, _) = commit(&table, action().rollback_to_time(TS + 3)).await;
+        assert_eq!(set_ref(&updates, MAIN_BRANCH), Some(&branch(2)));
+    }
+
+    #[tokio::test]
+    async fn test_rollback_then_ref_ops_compose() {
+        // Set/rollback composes with ref CRUD in one action: main moves and a tag is created.
+        let table = table_main_chain();
+        let (updates, requirements) =
+            commit(&table, action().rollback_to(1).create_tag("t", 2)).await;
+        assert_eq!(set_ref(&updates, MAIN_BRANCH), Some(&branch(1)));
+        assert_eq!(set_ref(&updates, "t"), Some(&tag(2)));
+        assert_eq!(requirement_for(&requirements, MAIN_BRANCH), Some(&Some(3)));
+        assert_eq!(requirement_for(&requirements, "t"), Some(&None));
     }
 
     #[tokio::test]
